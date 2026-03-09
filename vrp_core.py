@@ -24,7 +24,7 @@ DATA = load_data("data.json")
 
 # Tham số tối ưu cho bài toán VRP
 ALPHA = 1.0       # Hệ số chi phí trên mỗi đơn vị quãng đường di chuyển
-GAMMA = 5000.0    # Hình phạt (penalty) cho mỗi đơn hàng không được phục vụ
+GAMMA = 10000.0    # Hình phạt (penalty) cho mỗi đơn hàng không được phục vụ
 LW = 3600.0       # Thời gian chờ tối đa (giây) của hàng hóa kể từ khi lấy từ kho
 DEPOT = [0.0, 0.0] # Tọa độ vị trí kho trung tâm
 
