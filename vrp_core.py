@@ -1,36 +1,32 @@
 import math
+import json
+import os
 import numpy as np
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field
 
-# Dữ liệu bài toán mẫu
-DATA = {
-    "requests": [
-        [ 3738.682118759545,   3176.3620564508888,  0.9255958108248765, 1, 1358.7472330159917, 1242.4073038422487, 1602.4073038422487],
-        [-7332.379353375232,  -4188.522793367846,   0.7478413173478692, 1,  605.3789606058994,  652.9093445397065, 1012.9093445397065],
-        [ 5777.475570492262,  -7986.273425724185,   0.9634110342579557, 1, 1102.7598350528779, 1237.7513484295284, 1597.7513484295284],
-        [ 6996.942373406358,   4418.535163659321,   0.9908166528639936, 1,  722.3235983813729,  969.8366216562558, 1329.8366216562558],
-        [ 4400.906550671561,   2432.3349996395264, 10.776638065660618,  0, 1149.8366216562558, 1178.7472330159917, 1538.7472330159917],
-        [-1169.2698685472992,  3497.237946688962,  27.380202204619298,  0,    0.0,               55.679027962466364,  415.67902796246636],
-        [ 6710.724138902582,  -3348.9561871222304,  0.2506526123531701, 1,    0.0,               59.670309697854066,  419.67030969785407],
-        [ -216.72058856320808,-3938.133905039083,   0.8925640200120823, 1,  479.34061939570813, 425.37896060589935,  785.3789606058994 ],
-        [-3536.845602701436,   6049.129314355786,   1.0952132256820593, 1,  235.67902796246636, 278.16018765158515,  638.1601876515851 ],
-        [  586.8106635735363,  6329.938959833223,   0.5507433758448146, 1,  458.16018765158515, 542.3235983813729,   902.3235983813729 ],
-    ],
-    "truck_vel": 15.6464,
-    "drone_vel": 31.2928,
-    "truck_cap": 400.0,
-    "drone_cap": 2.27,
-    "drone_lim": 700.0,
-    "truck_num": 1,
-    "drone_num": 1,
-}
+# --- CẤU HÌNH DỮ LIỆU VÀ THAM SỐ BÀI TOÁN ---
+# Load dữ liệu từ file data.json
+def load_data(file_path="data.json"):
+    # Lấy đường dẫn tuyệt đối để tránh lỗi khi chạy từ thư mục khác
+    base_dir = os.path.dirname(__file__)
+    full_path = os.path.join(base_dir, file_path)
+    
+    if os.path.exists(full_path):
+        with open(full_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    else:
+        # Fallback dữ liệu mẫu nếu không tìm thấy file
+        print(f"CẢNH BÁO: Không tìm thấy {file_path}, sử dụng dữ liệu mặc định.")
+        return {"requests": [], "truck_vel": 15.0, "drone_vel": 30.0, "truck_cap": 400.0, "drone_cap": 2.27, "drone_lim": 700.0, "truck_num": 1, "drone_num": 1}
 
-# Tham số tối ưu cho lời giải VRP
-ALPHA = 1.0       # Chi phí trên mỗi mét di chuyển (cho cả xe tải và drone)
-GAMMA = 5000.0    # Hình phạt nặng cho việc từ chối đơn hàng (để ưu tiên phục vụ 100%)
-LW = 3600.0       # Thời gian chờ tối đa (s) hàng hóa trên xe
-DEPOT = [0.0, 0.0] # Vị trí kho trung tâm
+DATA = load_data("data.json")
+
+# Tham số tối ưu cho bài toán VRP
+ALPHA = 1.0       # Hệ số chi phí trên mỗi đơn vị quãng đường di chuyển
+GAMMA = 5000.0    # Hình phạt (penalty) cho mỗi đơn hàng không được phục vụ
+LW = 3600.0       # Thời gian chờ tối đa (giây) của hàng hóa kể từ khi lấy từ kho
+DEPOT = [0.0, 0.0] # Tọa độ vị trí kho trung tâm
 
 @dataclass(frozen=True)
 class Request:
@@ -72,53 +68,59 @@ class Trip:
 
     def eval(self, start_pos, vel, cap, dist_lim, Lw) -> bool:
         """
-        Mô phỏng chuyến đi để kiểm tra tính khả thi so với các ràng buộc.
-        Cập nhật các chỉ số nội bộ: return_time, total_dist, total_load, pis, wis.
-        
-        Các ràng buộc được kiểm tra:
-        1. Tải trọng: tổng khối lượng <= tải trọng phương tiện.
-        2. Khoảng cách: tổng quãng đường <= giới hạn (chỉ dành cho drone).
-        3. Cửa sổ thời gian: thời gian đến điểm dừng <= thời gian giao hàng muộn nhất (l_i).
-        4. Sự hài lòng của khách hàng: return_time - pickup_time <= Lw.
+        Giai đoạn 'mô phỏng' chuyến đi để kiểm tra xem nó có hợp lệ hay không.
+        Sử dụng logic của bài toán VRP với xe tải và drone:
+        - start_pos: Tọa độ bắt đầu (thường là DEPOT [0,0]).
+        - vel: Vận tốc phương tiện.
+        - cap: Tải trọng tối đa.
+        - dist_lim: Giới hạn quãng đường pin (drone).
+        - Lw: Thời gian tồn kho tối đa cho phép.
         """
         pos = start_pos
         t = self.depart_time
         dist_acc = 0.0
         load_acc = 0.0
-        pis = {}
+        pis = {} # Lưu lại thời gian bắt đầu xử lý từng đơn hàng
 
         for req in self.stops:
-            # 1. Kiểm tra tải trọng
+            # 1. KIỂM TRA TẢI TRỌNG (Capacity constraint)
             load_acc += req.demand
             if load_acc > cap:
                 return False
             
-            # 2. Kiểm tra khoảng cách
+            # 2. KIỂM TRA QUÃNG ĐƯỜNG (Distance/Battery constraint)
+            # Tính khoảng cách Euclidean từ vị trí hiện tại đến khách hàng tiếp theo
             leg = math.sqrt((pos[0] - req.x)**2 + (pos[1] - req.y)**2)
             dist_acc += leg
             if dist_acc > dist_lim:
                 return False
             
-            # 3. Kiểm tra cửa sổ thời gian
+            # 3. KIỂM TRA CỬA SỔ THỜI GIAN (Time Window constraint)
+            # Thời điểm phương tiện đến vị trí khách hàng
             arrival_time = t + leg / vel
             if arrival_time > req.l_i:
                 return False
             
-            # Thời gian lấy hàng thực tế là max(thời gian đến, thời gian sớm nhất)
+            # Thời điểm lấy hàng/phục vụ thực tế (phải nằm trong cửa sổ [e_i, l_i])
             pickup_time = max(arrival_time, req.e_i)
             pis[req.id] = pickup_time
+            
+            # Cập nhật vị trí và thời gian hiện tại của phương tiện
             pos = [req.x, req.y]
             t = pickup_time
 
-        # Quay về kho
+        # Quay về vị trí kho (DEPOT)
         leg_back = math.sqrt((pos[0] - 0.0)**2 + (pos[1] - 0.0)**2)
         dist_acc += leg_back
+        # Kiểm tra giới hạn quãng đường bao gồm cả lượt về
         if dist_acc > dist_lim:
             return False
         
+        # Thời điểm phương tiện quay về đến kho
         q_depot = t + leg_back / vel
         
-        # 4. Kiểm tra thời gian chờ Lw
+        # 4. KIỂM TRA HÀI LÒNG KHÁCH HÀNG (Waiting time constraint LW)
+        # Hàng không được ở trên xe quá lâu kể từ khi sẵn sàng ở kho cho đến khi xe về
         wis = {}
         for rid, p_i in pis.items():
             W_i = q_depot - p_i
@@ -126,7 +128,8 @@ class Trip:
                 return False
             wis[rid] = W_i
         
-        # Tất cả các bước kiểm tra đều đạt
+        # Nếu đi qua tất cả các bước mà không gặp False, chuyến đi là hợp lệ
+        # Cập nhật thông số thực tế cho đối tượng Trip
         self.return_time = q_depot
         self.total_dist = dist_acc
         self.total_load = load_acc
@@ -160,10 +163,12 @@ class VRPState:
 
     def objective(self) -> float:
         """
-        Tính toán giá trị hàm mục tiêu (tổng chi phí).
+        Tính toán giá trị hàm mục tiêu (Objective function) - Tổng chi phí cần tối thiểu hóa.
+        Chi phí = Alpha * (Tổng quãng đường) + Gamma * (Số đơn hàng bị bỏ sót)
         """
         dist_truck = sum(t.total_dist for v_trips in self.truck_trips for t in v_trips)
         dist_drone = sum(t.total_dist for v_trips in self.drone_trips for t in v_trips)
+        # alpha * tổng quãng đường + gamma * số đơn hàng không được phục vụ
         return self.alpha * (dist_truck + dist_drone) + self.gamma * len(self.unserved)
 
     def copy(self):
@@ -172,3 +177,53 @@ class VRPState:
         """
         import copy
         return copy.deepcopy(self)
+
+def print_solution(state: VRPState, name="SOLVER"):
+    """
+    In kết quả lời giải dưới dạng ngắn gọn (JSON-like), tương thích với định dạng của file result.jsonc.
+    
+    Định dạng này giúp dễ dàng so sánh kết quả giữa các thuật toán (Greedy, ALNS) và dữ liệu mẫu (Benchmark).
+    Mỗi dòng in ra là một đối tượng JSON đại diện cho:
+    1. "ROUTE": Lộ trình chi tiết của một phương tiện (xe tải hoặc drone).
+       - vehicle: Chỉ số của phương tiện.
+       - route: Một dictionary với key là thời gian (giây) và value là ID của điểm dừng (0 là kho).
+       - dropped: Danh sách các ID đơn hàng không được phục vụ.
+    2. "full_result": Tóm tắt tổng thể lời giải.
+       - result: [Tổng chi phí mục tiêu, Số đơn hàng bị bỏ sót].
+    """
+    dropped = sorted([r.id for r in state.unserved])
+    
+    # --- PHẦN 1: IN LỘ TRÌNH CHI TIẾT CỦA TỪNG PHƯƠNG TIỆN ---
+    v_idx = 0
+    
+    # Xử lý lộ trình cho các Xe tải (Truck)
+    for i, trips in enumerate(state.truck_trips):
+        route_data = {}
+        for t in trips:
+            # Lưu vết các điểm dừng trong chuyến đi
+            for s in t.stops:
+                # Sử dụng thời gian hoàn thành chuyến làm mốc thời gian (key)
+                route_data[str(int(t.return_time))] = s.id
+            # Điểm dừng cuối cùng luôn là kho (ID = 0)
+            route_data[str(int(t.return_time) + 1)] = 0 
+        
+        # In dưới dạng JSON một dòng
+        print(json.dumps({"__": "ROUTE", "_": "route_log", "vehicle": v_idx, "route": route_data, "dropped": dropped}))
+        v_idx += 1
+        
+    # Xử lý lộ trình cho các Drone
+    for i, trips in enumerate(state.drone_trips):
+        route_data = {}
+        for t in trips:
+            for s in t.stops:
+                route_data[str(int(t.return_time))] = s.id
+            route_data[str(int(t.return_time) + 1)] = 0
+            
+        print(json.dumps({"__": "ROUTE", "_": "route_log", "vehicle": v_idx, "route": route_data, "dropped": dropped}))
+        v_idx += 1
+
+    # --- PHẦN 2: IN TÓM TẮT KẾT QUẢ CUỐI CÙNG ---
+    obj_val = state.objective()
+    num_dropped = len(state.unserved)
+    # Hiển thị kết quả tổng hợp bao gồm chi phí (đã làm tròn) và số lượng đơn bị bỏ sót
+    print(json.dumps({"__": name, "_": "full_result", "result": [round(obj_val, 2), num_dropped]}, ensure_ascii=False))
