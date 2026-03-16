@@ -4,215 +4,140 @@ import numpy as np
 import random
 import math
 from alns import ALNS
-from alns.accept import HillClimbing, SimulatedAnnealing
+from alns.accept import SimulatedAnnealing
 from alns.select import RouletteWheel
 from alns.stop import MaxIterations
 
-def random_removal(state: VRPState, rnd_state):
-    """Remove a random subset of requests."""
-    new_state = state.copy()
-    all_served = []
-    
-    for v_trips in new_state.truck_trips + new_state.drone_trips:
-        for t in v_trips:
-            all_served.extend([(t, r) for r in t.stops])
-    
-    if not all_served:
-        return new_state
-        
-    k = max(1, int(len(new_state.requests) * 0.3))
-    num_to_remove = min(len(all_served), k)
-    
-    to_remove_indices = rnd_state.choice(len(all_served), num_to_remove, replace=False)
-    
-    for idx in to_remove_indices:
-        trip, req = all_served[idx]
-        if req in trip.stops:
-            trip.stops.remove(req)
-            new_state.unserved.add(req)
-    
-    new_state.truck_trips = [[t for t in v if t.stops] for v in new_state.truck_trips]
-    new_state.drone_trips = [[t for t in v if t.stops] for v in new_state.drone_trips]
-    return new_state
+def clean_state(state):
+    """Purge empty trips from the solution to keep the search space clean."""
+    state.truck_trips = [[t for t in v if t.stops] for v in state.truck_trips]
+    state.drone_trips = [[t for t in v if t.stops] for v in state.drone_trips]
+    return state
 
-def shaw_removal(state: VRPState, rnd_state):
-    """Remove similar (related) requests based on distance and time."""
+def random_removal(state: VRPState, random_state):
+    """Destruction: Removes ~30% of served requests at random."""
     new_state = state.copy()
-    all_served_reqs = []
-    for v_trips in new_state.truck_trips + new_state.drone_trips:
-        for t in v_trips:
-            all_served_reqs.extend([r for r in t.stops])
-            
-    if not all_served_reqs: return new_state
+    all_served = [(t, r) for v in new_state.truck_trips + new_state.drone_trips for t in v for r in t.stops]
+    if not all_served: return new_state
     
-    pivot = rnd_state.choice(all_served_reqs)
+    k = min(len(all_served), max(1, int(len(new_state.requests) * 0.3)))
+    for idx in random_state.choice(len(all_served), k, replace=False):
+        trip, req = all_served[idx]
+        trip.stops.remove(req)
+        new_state.unserved.add(req)
+    return clean_state(new_state)
+
+def shaw_removal(state: VRPState, random_state):
+    """Destruction: Removes orders that are 'similar' (clustered by space and time availability)."""
+    new_state = state.copy()
+    all_reqs = [r for v in new_state.truck_trips + new_state.drone_trips for t in v for r in t.stops]
+    if not all_reqs: return new_state
     
-    def relatedness(r1, r2):
-        dist = math.sqrt((r1.x-r2.x)**2 + (r1.y-r2.y)**2)
-        time_diff = abs(r1.r_i - r2.r_i)
-        return dist + 0.1 * time_diff 
-        
-    all_served_reqs.sort(key=lambda r: relatedness(pivot, r))
+    # Select a random anchor and find its neighbors
+    pivot = random_state.choice(all_reqs)
+    all_reqs.sort(key=lambda r: math.sqrt((pivot.x-r.x)**2 + (pivot.y-r.y)**2) + 0.1 * abs(pivot.request_time - r.request_time))
     
-    num_to_remove = max(1, int(len(new_state.requests) * 0.4))
-    to_remove = all_served_reqs[:num_to_remove]
-    
-    for req in to_remove:
-        for v_trips in new_state.truck_trips + new_state.drone_trips:
-            for t in v_trips:
+    k = max(1, int(len(new_state.requests) * 0.4))
+    for req in all_reqs[:k]:
+        for v in new_state.truck_trips + new_state.drone_trips:
+            for t in v:
                 if req in t.stops:
                     t.stops.remove(req)
                     new_state.unserved.add(req)
-                    
-    new_state.truck_trips = [[t for t in v if t.stops] for v in new_state.truck_trips]
-    new_state.drone_trips = [[t for t in v if t.stops] for v in new_state.drone_trips]
-    return new_state
+    return clean_state(new_state)
 
-def worst_removal(state: VRPState, rnd_state):
-    """Remove requests with the highest cost contribution."""
+def worst_removal(state: VRPState, random_state):
+    """Destruction: Removes orders that cause the highest distance increase in their current trips."""
     new_state = state.copy()
-    all_served = [] 
+    costs, conf = [], new_state.data
     
-    for v_trips in new_state.truck_trips + new_state.drone_trips:
-        for t in v_trips:
-            base_dist = t.total_dist
-            v_vel = state.data["drone_vel"] if t.vtype == 'drone' else state.data["truck_vel"]
-            v_cap = state.data["drone_cap"] if t.vtype == 'drone' else state.data["truck_cap"]
-            v_lim = (state.data["drone_lim"] * v_vel) if t.vtype == 'drone' else float('inf')
-            
+    for v in new_state.truck_trips + new_state.drone_trips:
+        for t in v:
+            vel, cap, d_lim = (conf["drone_vel"], conf["drone_cap"], conf["drone_lim"]*conf["drone_vel"]) if t.vehicle_type == 'drone' else (conf["truck_vel"], conf["truck_cap"], float('inf'))
             for i, req in enumerate(t.stops):
                 temp_stops = t.stops[:i] + t.stops[i+1:]
-                if not temp_stops:
-                    contribution = base_dist
+                if not temp_stops: loss = t.total_dist
                 else:
-                    temp_trip = Trip(vtype=t.vtype, vidx=t.vidx, stops=temp_stops, depart_time=t.depart_time)
-                    if temp_trip.eval([0,0], v_vel, v_cap, v_lim, state.lw):
-                        contribution = base_dist - temp_trip.total_dist
-                    else:
-                        contribution = 0
-                all_served.append({'trip': t, 'req': req, 'cost': contribution})
+                    tmp = Trip(t.vehicle_type, t.vehicle_index, temp_stops, t.depart_time)
+                    loss = t.total_dist - tmp.total_dist if tmp.eval(new_state.dist_matrix, vel, cap, d_lim, state.max_wait_time) else 0
+                costs.append({'t': t, 'r': req, 'cost': loss})
     
-    if not all_served: return new_state
+    if not costs: return new_state
+    costs.sort(key=lambda x: x['cost'], reverse=True)
+    k = min(len(costs), max(1, int(len(new_state.requests) * 0.2)))
     
-    all_served.sort(key=lambda x: x['cost'], reverse=True)
-    k = max(1, int(len(new_state.requests) * 0.2)) 
-    num_to_remove = min(len(all_served), k)
-    
-    for _ in range(num_to_remove):
-        idx = int(rnd_state.random()**3 * len(all_served))
-        item = all_served.pop(idx)
-        if item['req'] in item['trip'].stops:
-            item['trip'].stops.remove(item['req'])
-            new_state.unserved.add(item['req'])
-            
-    new_state.truck_trips = [[t for t in v if t.stops] for v in new_state.truck_trips]
-    new_state.drone_trips = [[t for t in v if t.stops] for v in new_state.drone_trips]
-    return new_state
+    # Use random^3 to bias selection towards 'worst' items while keeping some diversity
+    for _ in range(k):
+        item = costs.pop(int(random_state.random()**3 * len(costs)))
+        if item['r'] in item['t'].stops:
+            item['t'].stops.remove(item['r'])
+            new_state.unserved.add(item['r'])
+    return clean_state(new_state)
 
-def string_removal(state: VRPState, rnd_state):
-    """Remove a sequence of consecutive requests from a random trip."""
+def string_removal(state: VRPState, random_state):
+    """Destruction: Removes a contiguous sequence of stops from a single trip."""
     new_state = state.copy()
-    all_trips = [t for v_trips in new_state.truck_trips + new_state.drone_trips for t in v_trips if t.stops]
-    if not all_trips: return new_state
+    trips = [t for v in new_state.truck_trips + new_state.drone_trips for t in v if t.stops]
+    if not trips: return new_state
     
-    trip = rnd_state.choice(all_trips)
-    max_string = min(len(trip.stops), 4)
-    size = rnd_state.randint(1, max_string + 1)
-    start = rnd_state.randint(0, len(trip.stops) - size + 1)
+    trip = random_state.choice(trips)
+    size = random_state.randint(1, min(len(trip.stops), 4) + 1)
+    start = random_state.randint(0, len(trip.stops) - size + 1)
     
-    to_remove = trip.stops[start:start+size]
-    for req in list(to_remove):
+    for req in list(trip.stops[start:start+size]):
         trip.stops.remove(req)
         new_state.unserved.add(req)
+    return clean_state(new_state)
 
-    new_state.truck_trips = [[t for t in v if t.stops] for v in new_state.truck_trips]
-    new_state.drone_trips = [[t for t in v if t.stops] for v in new_state.drone_trips]
-    return new_state
-
-def greedy_repair(state: VRPState, rnd_state):
-    """Repair method using greedy insertion."""
+def greedy_repair(state: VRPState, random_state):
+    """Repair: Simply re-insert removed requests using the greedy heuristic."""
     return solve_greedy(state)
 
-def regret_repair(state: VRPState, rnd_state):
-    """Repair method prioritizing requests with high regret cost."""
+def regret_repair(state: VRPState, random_state):
+    """Repair: Inserts the request with the highest 'regret' (Best_cost - Second_best_cost)."""
     new_state = state.copy()
+    conf = new_state.data
     
     while new_state.unserved:
-        best_regret = -1.0
-        best_req = None
-        best_cand = None
-        
+        best_regret, best_req, best_cand = -1.0, None, None
         for req in list(new_state.unserved):
-            candidates = get_insertion_candidates(new_state, req)
-            if not candidates: continue
-            
-            c1 = candidates[0][0]
-            c2 = candidates[1][0] if len(candidates) > 1 else GAMMA 
-            regret = c2 - c1
-            
+            cands = get_insertion_candidates(new_state, req)
+            if not cands: continue
+            # Regret measures the loss if we DON'T pick the best insertion now
+            regret = (cands[1][0] if len(cands) > 1 else GAMMA) - cands[0][0]
             if regret > best_regret:
-                best_regret = regret
-                best_req = req
-                best_cand = candidates[0]
+                best_regret, best_req, best_cand = regret, req, cands[0]
         
         if not best_req: break
+        cost, v_type, v_idx, t_idx, pos, dep = best_cand
+        vel, cap, d_lim = (conf["drone_vel"], conf["drone_cap"], conf["drone_lim"]*conf["drone_vel"]) if v_type == 'drone' else (conf["truck_vel"], conf["truck_cap"], float('inf'))
+        v_trips = new_state.drone_trips[v_idx] if v_type == 'drone' else new_state.truck_trips[v_idx]
         
-        cost, vtype, vidx, trip_idx, pos, depart = best_cand
-        d_vel, t_vel = new_state.data["drone_vel"], new_state.data["truck_vel"]
-        d_cap, t_cap = new_state.data["drone_cap"], new_state.data["truck_cap"]
-        d_lim = new_state.data["drone_lim"] * d_vel
-        
-        if trip_idx < 0:
-            new_trip = Trip(vtype=vtype, vidx=vidx, stops=[best_req], depart_time=depart)
-            vel = d_vel if vtype == 'drone' else t_vel
-            cap = d_cap if vtype == 'drone' else t_cap
-            dist_lim = d_lim if vtype == 'drone' else float('inf')
-            new_trip.eval([0,0], vel, cap, dist_lim, new_state.lw)
-            if vtype == 'drone': new_state.drone_trips[vidx].insert(pos, new_trip)
-            else: new_state.truck_trips[vidx].insert(pos, new_trip)
+        if t_idx < 0:
+            trip = Trip(v_type, v_idx, [best_req], dep)
+            trip.eval(new_state.dist_matrix, vel, cap, d_lim, new_state.max_wait_time)
+            v_trips.insert(pos, trip)
         else:
-            trip = (new_state.drone_trips[vidx][trip_idx] if vtype == 'drone' else new_state.truck_trips[vidx][trip_idx])
+            trip = v_trips[t_idx]
             trip.stops.insert(pos, best_req)
-            trip.depart_time = depart
-            vel = d_vel if vtype == 'drone' else t_vel
-            cap = d_cap if vtype == 'drone' else t_cap
-            dist_lim = d_lim if vtype == 'drone' else float('inf')
-            trip.eval([0,0], vel, cap, dist_lim, new_state.lw)
-            
+            trip.depart_time = dep
+            trip.eval(new_state.dist_matrix, vel, cap, d_lim, new_state.max_wait_time)
         new_state.unserved.remove(best_req)
-        
     return new_state
 
-def solve_alns(iterations=10000):
-    """Main execution of the ALNS algorithm."""
-    initial_state = VRPState(DATA, LW, ALPHA, GAMMA)
-    initial_sol = solve_greedy(initial_state)
-    
-    print("--- INITIAL GREEDY RESULT ---")
-    print_solution(initial_sol, name="INITIAL_GREEDY")
-    
+def solve_alns(iterations=1000):
+    """Main Optimization Cycle: Destroy -> Repair -> Accept/Reject."""
     alns = ALNS(np.random.RandomState(42))
+    for op in [random_removal, shaw_removal, worst_removal, string_removal]: alns.add_destroy_operator(op)
+    for op in [greedy_repair, regret_repair]: alns.add_repair_operator(op)
     
-    alns.add_destroy_operator(random_removal)
-    alns.add_destroy_operator(shaw_removal)
-    alns.add_destroy_operator(worst_removal)
-    alns.add_destroy_operator(string_removal)
+    # Warm-start with Greedy
+    init = solve_greedy(VRPState(DATA, LW, ALPHA, GAMMA))
     
-    alns.add_repair_operator(greedy_repair)
-    alns.add_repair_operator(regret_repair)
-    
-    select = RouletteWheel([50, 20, 5, 2], 0.8, 2, 1) 
-    accept = SimulatedAnnealing(5000, 1, 0.9997)
-    stop = MaxIterations(iterations)
-    
-    print(f"\nRunning ALNS for {iterations} iterations. Please wait...")
-    result = alns.iterate(initial_sol, select, accept, stop)
-    
+    # Configure Adaptive Weights and Simulated Annealing
+    result = alns.iterate(init, RouletteWheel([50, 20, 5, 2], 0.8, 4, 1), 
+                          SimulatedAnnealing(5000, 1, 0.9997), MaxIterations(iterations))
     return result.best_state
 
 if __name__ == "__main__":
-    best_state = solve_alns(iterations=1000)
-    print("\n" + "="*50)
-    print("      ALNS OPTIMIZATION COMPLETE!")
-    print("="*50)
-    print_solution(best_state, name="ALNS_FINAL")
+    print_solution(solve_alns(1000), name="ALNS_FINAL")
